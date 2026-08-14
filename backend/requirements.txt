@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+nbformat>=5.10
+nbclient>=0.10
+jupyter-client>=8.6
+google-genai>=1.0
+pydantic>=2.8
