@@ -12,16 +12,25 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from nbclient import NotebookClient
 from pydantic import BaseModel, Field
+from google import genai
+from dotenv import load_dotenv
+from fastapi.responses import JSONResponse
+from openai import OpenAI
 
-try:
-    from google import genai
-except Exception:  # optional until an API key is used
-    genai = None
-
+load_dotenv()
+api_key = os.getenv("GEMINI_API_KEY")
+model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 MAX_NOTEBOOK_BYTES = 5 * 1024 * 1024
 MAX_EXECUTED_CELLS = 8
 
 app = FastAPI(title="NotebookPilot API", version="0.1.0")
+api_key = os.getenv("OPENROUTER_API_KEY")
+model_name = os.getenv("OPENROUTER_MODEL")
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=api_key,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -29,6 +38,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class ChatRequest(BaseModel):
+    prompt: str
+    notebook_path: str
+    cells: list[dict]
 
 
 class SelectedCell(BaseModel):
@@ -66,15 +80,19 @@ def _cell_catalog(nb) -> list[dict[str, Any]]:
 
 
 def _gemini_select(nb, task: str) -> SelectionPlan | None:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or genai is None:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    model_name = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+
+    if not api_key:
         return None
 
-    model = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
     cells = _cell_catalog(nb)
+
     compact = "\n\n".join(
-        f"CELL {c['index']} [{c['type']}]\n{c['source']}" for c in cells
+        f"CELL {c['index']} [{c['type']}]\n{c['source']}"
+        for c in cells
     )
+
     prompt = f"""
 You are selecting Jupyter notebook cells to execute for a user's task.
 
@@ -85,37 +103,92 @@ NOTEBOOK:
 {compact}
 
 Choose the smallest useful subset of CODE cells that can accomplish the task.
+
 Important rules:
 - Preserve original execution order.
 - Include prerequisite import/setup/data-loading cells when required.
 - Do not select markdown cells.
 - Prefer at most {MAX_EXECUTED_CELLS} code cells.
 - Never invent cell indices.
-- Give a very short reason per selected cell and a short execution plan.
+- Give a very short reason for each selected cell.
+- Give a short overall execution plan.
+
+Return ONLY valid JSON in this exact format:
+
+{{
+  "selected": [
+    {{
+      "index": 0,
+      "reason": "short reason"
+    }}
+  ],
+  "plan": "short execution plan"
+}}
 """
 
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_json_schema": SelectionPlan.model_json_schema(),
-            "temperature": 0.1,
-        },
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
     )
-    plan = SelectionPlan.model_validate_json(response.text)
 
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Notebook Pilot. "
+                        "Select the minimum notebook cells needed "
+                        "to accomplish the user's task. "
+                        "Return only valid JSON."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            temperature=0,
+        )
+
+        answer = response.choices[0].message.content
+
+        if not answer:
+            return None
+
+        # Some models may still wrap JSON in ```json ... ```
+        answer = answer.strip()
+
+        if answer.startswith("```"):
+            answer = answer.removeprefix("```json")
+            answer = answer.removeprefix("```")
+            answer = answer.removesuffix("```")
+            answer = answer.strip()
+
+        plan = SelectionPlan.model_validate_json(answer)
+
+    except Exception as e:
+        print("OpenRouter cell selection failed:", repr(e))
+        return None
+
+    # Validate that the model only selected real, non-empty code cells.
     valid_code = {
-        i for i, cell in enumerate(nb.cells) if cell.cell_type == "code" and cell.source.strip()
+        i
+        for i, cell in enumerate(nb.cells)
+        if cell.cell_type == "code" and cell.source.strip()
     }
+
     seen = set()
     selected = []
+
     for item in sorted(plan.selected, key=lambda x: x.index):
         if item.index in valid_code and item.index not in seen:
             selected.append(item)
             seen.add(item.index)
+
     plan.selected = selected[:MAX_EXECUTED_CELLS]
+
     return plan if plan.selected else None
 
 
@@ -134,7 +207,6 @@ def _tokens(text: str) -> set[str]:
 
 
 def _heuristic_select(nb, task: str) -> SelectionPlan:
-    """Deterministic fallback so the demo works without an API key."""
     task_tokens = _tokens(task)
     code_indices = [
         i for i, c in enumerate(nb.cells) if c.cell_type == "code" and c.source.strip()
@@ -148,7 +220,6 @@ def _heuristic_select(nb, task: str) -> SelectionPlan:
         overlap = len(task_tokens & src_tokens)
         score = float(overlap)
         lowered = nb.cells[i].source.lower()
-        # Only add an intent bonus when the user actually mentioned that operation.
         intent_words = ["fit", "predict", "plot", "train", "evaluate", "mean", "model"]
         for keyword in intent_words:
             if keyword in task.lower() and keyword in lowered:
@@ -198,7 +269,6 @@ def _select(nb, task: str) -> tuple[SelectionPlan, str]:
         if plan:
             return plan, "gemini"
     except Exception as exc:
-        # Demo reliability > hard failure. The response tells the UI it used fallback mode.
         print(f"Gemini selection failed; using fallback: {exc}")
     return _heuristic_select(nb, task), "heuristic"
 
@@ -285,3 +355,88 @@ async def run_agent(file: UploadFile = File(...), task: str = Form(...)):
         "executed_count": len(trace),
         "total_cells": len(nb.cells),
     }
+
+# @app.post("/chat")
+# async def chat(req: ChatRequest):
+#     notebook_text = "\n\n".join(
+#         f"Cell {i} ({cell.get('cell_type')}):\n{cell.get('source', '')}"
+#         for i, cell in enumerate(req.cells)
+#     )
+
+#     full_prompt = f"""
+# You are Notebook Pilot, an assistant helping a user understand
+# and work with their Jupyter notebook.
+
+# Notebook: {req.notebook_path}
+
+# Notebook cells:
+# {notebook_text}
+
+# User request:
+# {req.prompt}
+
+# Answer based on the notebook.
+# """
+
+#     response = client.models.generate_content(
+#         model="YOUR_CURRENT_GEMINI_MODEL",
+#         contents=full_prompt,
+#     )
+
+#     return {
+#         "response": response.text
+#     }
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    try:
+        notebook_text = "\n\n".join(
+            f"Cell {i} ({cell.get('cell_type')}):\n"
+            f"{cell.get('source', '')}"
+            for i, cell in enumerate(req.cells)
+        )
+
+        full_prompt = f"""
+Notebook: {req.notebook_path}
+
+Notebook cells:
+{notebook_text}
+
+User request:
+{req.prompt}
+
+Answer based on the notebook.
+"""
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are Notebook Pilot, an assistant helping "
+                        "a user understand and work with Jupyter notebooks."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": full_prompt,
+                },
+            ],
+        )
+
+        answer = response.choices[0].message.content
+
+        return {
+            "response": answer
+        }
+
+    except Exception as e:
+        print("CHAT ERROR:", repr(e))
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": type(e).__name__,
+                "detail": str(e),
+            },
+        )
