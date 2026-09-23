@@ -71,10 +71,6 @@ The desired behavior is to execute the import/data/model-fit path while skipping
 
 It returns the planner mode, selected cells, reasons, execution plan, cell source, and outputs.
 
-## Demo talking points
-
-> NotebookPilot is a task-conditioned execution agent for Jupyter notebooks. It parses the real notebook graph, asks an LLM for the minimal relevant execution path, then runs only those cells in a fresh kernel and exposes the full trace. I built the fallback planner so the demo doesn't depend on an API call succeeding.
-
 ## Scope / safety
 
 This is intentionally a local MVP. It executes notebook code, so only run notebooks you trust. A production version should execute in isolated containers with resource/network limits and add a dependency graph / static analysis pass before LLM planning.
